@@ -41,6 +41,7 @@ THE SOFTWARE.
 #include <amgcl/coarsening/detail/galerkin.hpp>
 #include <amgcl/mpi/util.hpp>
 #include <amgcl/mpi/distributed_matrix.hpp>
+#include <amgcl/mpi/coarsening/conn_strength.hpp>
 
 namespace amgcl {
 namespace mpi {
@@ -51,6 +52,7 @@ struct smoothed_pmis {
     typedef typename Backend::value_type value_type;
     typedef typename math::scalar_of<value_type>::type scalar_type;
     typedef backend::crs<value_type> build_matrix;
+    typedef backend::crs<bool> bool_matrix;
 
     struct params {
         /// Strong connectivity threshold
@@ -99,9 +101,19 @@ struct smoothed_pmis {
     transfer_operators(const distributed_matrix<Backend> &A) {
         typedef distributed_matrix<Backend> DM;
 
+        ptrdiff_t n = A.loc_rows();
+
+        const build_matrix &A_loc = *A.local();
+        const build_matrix &A_rem = *A.remote();
+
         communicator comm = A.comm();
 
-        scalar_type eps_squared = prm.eps_strong * prm.eps_strong;
+        // Strength of connection
+        boost::shared_ptr< distributed_matrix< backend::builtin<bool> > > S = conn_strength(A, prm.eps_strong);
+
+        bool_matrix &S_loc = *S->local();
+        bool_matrix &S_rem = *S->remote();
+
         prm.eps_strong *= 0.5;
 
         scalar_type omega = prm.relax;
@@ -111,99 +123,63 @@ struct smoothed_pmis {
             omega *= static_cast<scalar_type>(2.0/3);
         }
 
-        // 1. Create filtered matrix
+        boost::shared_ptr<DM> P_tent = tentative_prolongation(*S, A.backend_prm());
+
+        // Create filtered matrix
         AMGCL_TIC("filtered matrix");
-        ptrdiff_t n = A.loc_rows();
-
-        const build_matrix &A_loc = *A.local();
-        const build_matrix &A_rem = *A.remote();
-        const comm_pattern<Backend> &Ap = A.cpat();
-
         boost::shared_ptr<build_matrix> af_loc = boost::make_shared<build_matrix>();
         boost::shared_ptr<build_matrix> af_rem = boost::make_shared<build_matrix>();
 
         build_matrix &Af_loc = *af_loc;
         build_matrix &Af_rem = *af_rem;
 
-        Af_loc.set_size(n, n, true);
-        Af_rem.set_size(n, 0, true);
+        backend::numa_vector<value_type> Af_loc_val(S_loc.nnz, false);
+        backend::numa_vector<value_type> Af_rem_val(S_rem.nnz, false);
 
-        boost::shared_ptr< backend::numa_vector<value_type> > D = backend::diagonal(A_loc);
-        backend::numa_vector<value_type> Df(n, false);
+        Af_loc.nrows    = S_loc.nrows;
+        Af_loc.ncols    = S_loc.ncols;
+        Af_loc.nnz      = S_loc.nnz;
+        Af_loc.ptr      = S_loc.ptr;
+        Af_loc.col      = S_loc.col;
+        Af_loc.val      = &Af_loc_val[0];
+        Af_loc.own_data = false;
 
-        std::vector<value_type> D_loc(Ap.send.count());
-        std::vector<value_type> D_rem(Ap.recv.count());
-
-        for(size_t i = 0, nv = Ap.send.count(); i < nv; ++i)
-            D_loc[i] = (*D)[Ap.send.col[i]];
-
-        Ap.exchange(&D_loc[0], &D_rem[0]);
-
-#pragma omp parallel for
-        for(ptrdiff_t i = 0; i < n; ++i) {
-            value_type dia_i = (*D)[i];
-            value_type dia_f = dia_i;
-            value_type eps_dia_i = eps_squared * dia_i;
-
-            for(ptrdiff_t j = A_loc.ptr[i], e = A_loc.ptr[i+1]; j < e; ++j) {
-                ptrdiff_t  c = A_loc.col[j];
-                value_type v = A_loc.val[j];
-
-                if (c == i || (eps_dia_i * (*D)[c] < v * v)) {
-                    ++Af_loc.ptr[i+1];
-                } else {
-                    dia_f += v;
-                }
-            }
-
-            for(ptrdiff_t j = A_rem.ptr[i], e = A_rem.ptr[i+1]; j < e; ++j) {
-                ptrdiff_t  c = Ap.local_index(A_rem.col[j]);
-                value_type v = A_rem.val[j];
-
-                if (eps_dia_i * D_rem[c] < v * v) {
-                    ++Af_rem.ptr[i+1];
-                } else {
-                    dia_f += v;
-                }
-            }
-
-            Df[i] = dia_f;
-        }
-
-        Af_loc.set_nonzeros(Af_loc.scan_row_sizes());
-        Af_rem.set_nonzeros(Af_rem.scan_row_sizes());
+        Af_rem.nrows    = S_rem.nrows;
+        Af_rem.ncols    = S_rem.ncols;
+        Af_rem.nnz      = S_rem.nnz;
+        Af_rem.ptr      = S_rem.ptr;
+        Af_rem.col      = S_rem.col;
+        Af_rem.val      = &Af_rem_val[0];
+        Af_rem.own_data = false;
 
 #pragma omp parallel for
         for(ptrdiff_t i = 0; i < n; ++i) {
-            value_type dia_f = -omega * math::inverse(Df[i]);
-            value_type eps_dia_i = eps_squared * (*D)[i];
-            ptrdiff_t loc_head = Af_loc.ptr[i];
-            ptrdiff_t rem_head = Af_rem.ptr[i];
+            value_type dia_f = math::zero<value_type>();
+
+            for(ptrdiff_t j = A_loc.ptr[i], e = A_loc.ptr[i+1]; j < e; ++j)
+                if (A_loc.col[j] == i || !S_loc.val[j]) dia_f += A_loc.val[j];
+
+            for(ptrdiff_t j = A_rem.ptr[i], e = A_rem.ptr[i+1]; j < e; ++j)
+                if (!S_rem.val[j]) dia_f += A_rem.val[j];
+
+            dia_f = -omega * math::inverse(dia_f);
+
+            ptrdiff_t loc_head = S_loc.ptr[i];
+            ptrdiff_t rem_head = S_rem.ptr[i];
 
             for(ptrdiff_t j = A_loc.ptr[i], e = A_loc.ptr[i+1]; j < e; ++j) {
-                ptrdiff_t  c = A_loc.col[j];
-                value_type v = A_loc.val[j];
+                ptrdiff_t c = A_loc.col[j];
 
                 if (c == i) {
-                    Af_loc.col[loc_head] = c;
-                    Af_loc.val[loc_head] = (1 - omega) * math::identity<value_type>();
-                    ++loc_head;
-                } else if(eps_dia_i * (*D)[c] < v * v) {
-                    Af_loc.col[loc_head] = c;
-                    Af_loc.val[loc_head] = dia_f * v;
-                    ++loc_head;
+                    Af_loc_val[loc_head++] = (1 - omega) * math::identity<value_type>();
+                } else if(S_loc.val[j]) {
+                    Af_loc_val[loc_head++] = dia_f * A_loc.val[j];
                 }
             }
 
             for(ptrdiff_t j = A_rem.ptr[i], e = A_rem.ptr[i+1]; j < e; ++j) {
-                ptrdiff_t  c = A_rem.col[j];
-                ptrdiff_t  k = Ap.local_index(c);
-                value_type v = A_rem.val[j];
-
-                if (eps_dia_i * D_rem[k] < v * v) {
-                    Af_rem.col[rem_head] = c;
-                    Af_rem.val[rem_head] = dia_f * v;
-                    ++rem_head;
+                if (S_rem.val[j]) {
+                    Af_rem_val[rem_head++] = dia_f * A_rem.val[j];
                 }
             }
         }
@@ -211,11 +187,7 @@ struct smoothed_pmis {
         boost::shared_ptr<DM> Af = boost::make_shared<DM>(comm, af_loc, af_rem, A.backend_prm());
         AMGCL_TOC("filtered matrix");
 
-        AMGCL_TIC("tentative prolongation");
-        boost::shared_ptr<DM> P_tent = tentative_prolongation(*Af);
-        AMGCL_TOC("tentative prolongation");
-
-        // 5. Smooth tentative prolongation with the filtered matrix.
+        // Smooth tentative prolongation with the filtered matrix.
         AMGCL_TIC("smoothing");
         boost::shared_ptr<DM> P = product(*Af, *P_tent);
         AMGCL_TOC("smoothing");
@@ -224,25 +196,29 @@ struct smoothed_pmis {
     }
 
     boost::shared_ptr< distributed_matrix<Backend> >
-    tentative_prolongation(const distributed_matrix<Backend> &Af) {
+    tentative_prolongation(const distributed_matrix< backend::builtin<bool> > &S,
+            const typename Backend::params &bprm)
+    {
+        AMGCL_TIC("tentative prolongation");
         typedef distributed_matrix<Backend> DM;
+        typedef distributed_matrix< backend::builtin<bool> > BM;
 
         static const int tag_exc_cnt = 4001;
         static const int tag_exc_pts = 4002;
 
-        const build_matrix &Af_loc = *Af.local();
-        const build_matrix &Af_rem = *Af.remote();
+        const bool_matrix &S_loc = *S.local();
+        const bool_matrix &S_rem = *S.remote();
 
-        ptrdiff_t n = Af_loc.nrows;
+        ptrdiff_t n = S_loc.nrows;
 
-        communicator comm = Af.comm();
+        communicator comm = S.comm();
 
         // 1. Get symbolic square of the filtered matrix.
         AMGCL_TIC("symbolic square");
-        boost::shared_ptr<DM> S = symb_product(Af, Af);
-        const build_matrix &S_loc = *S->local();
-        const build_matrix &S_rem = *S->remote();
-        const comm_pattern<Backend> &Sp = S->cpat();
+        boost::shared_ptr<BM> S2 = symb_product(S, S);
+        const bool_matrix &S2_loc = *S2->local();
+        const bool_matrix &S2_rem = *S2->remote();
+        const comm_pattern< backend::builtin<bool> > &Sp = S2->cpat();
         AMGCL_TOC("symbolic square");
 
         // 2. Apply PMIS algorithm to the symbolic square.
@@ -259,8 +235,8 @@ struct smoothed_pmis {
         // Remove lonely nodes.
 #pragma omp parallel for reduction(+:n_undone)
         for(ptrdiff_t i = 0; i < n; ++i) {
-            ptrdiff_t wl = Af_loc.ptr[i+1] - Af_loc.ptr[i];
-            ptrdiff_t wr = S_rem.ptr[i+1] - S_rem.ptr[i];
+            ptrdiff_t wl = S_loc.ptr[i+1] - S_loc.ptr[i];
+            ptrdiff_t wr = S2_rem.ptr[i+1] - S2_rem.ptr[i];
 
             if (wl + wr == 1) {
                 loc_state[i] = deleted;
@@ -287,20 +263,20 @@ struct smoothed_pmis {
 
         std::vector<ptrdiff_t> nbr;
 
-        while(true) {
-            for(size_t i = 0; i < Sp.recv.nbr.size(); ++i)
-                send_pts[i].clear();
+        for(size_t i = 0; i < Sp.recv.nbr.size(); ++i)
+            send_pts[i].reserve(2 * (Sp.recv.ptr[i+1] - Sp.recv.ptr[i]));
 
+        while(true) {
             if (n_undone) {
                 for(ptrdiff_t i = 0; i < n; ++i) {
                     if (loc_state[i] != undone) continue;
 
-                    if (S_rem.ptr[i+1] > S_rem.ptr[i]) {
+                    if (S2_rem.ptr[i+1] > S2_rem.ptr[i]) {
                         // Boundary points
                         bool selectable = true;
-                        for(ptrdiff_t j = S_rem.ptr[i], e = S_rem.ptr[i+1]; j < e; ++j) {
+                        for(ptrdiff_t j = S2_rem.ptr[i], e = S2_rem.ptr[i+1]; j < e; ++j) {
                             int d,c;
-                            boost::tie(d,c) = Sp.remote_info(S_rem.col[j]);
+                            boost::tie(d,c) = Sp.remote_info(S2_rem.col[j]);
 
                             if (rem_state[c] == undone && Sp.recv.nbr[d] > comm.rank) {
                                 selectable = false;
@@ -316,8 +292,8 @@ struct smoothed_pmis {
                         --n_undone;
 
                         // Af gives immediate neighbors
-                        for(ptrdiff_t j = Af_loc.ptr[i], e = Af_loc.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_loc.col[j];
+                        for(ptrdiff_t j = S_loc.ptr[i], e = S_loc.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = S_loc.col[j];
                             if (c != i) {
                                 if (loc_state[c] == undone) --n_undone;
                                 loc_owner[c] = comm.rank;
@@ -325,8 +301,8 @@ struct smoothed_pmis {
                             }
                         }
 
-                        for(ptrdiff_t j = Af_rem.ptr[i], e = Af_rem.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_rem.col[j];
+                        for(ptrdiff_t j = S_rem.ptr[i], e = S_rem.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = S_rem.col[j];
                             int d,k;
                             boost::tie(d,k) = Sp.remote_info(c);
 
@@ -336,8 +312,8 @@ struct smoothed_pmis {
                         }
 
                         // S gives removed neighbors
-                        for(ptrdiff_t j = S_loc.ptr[i], e = S_loc.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = S_loc.col[j];
+                        for(ptrdiff_t j = S2_loc.ptr[i], e = S2_loc.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = S2_loc.col[j];
                             if (c != i && loc_state[c] == undone) {
                                 loc_owner[c] = comm.rank;
                                 loc_state[c] = id;
@@ -345,8 +321,8 @@ struct smoothed_pmis {
                             }
                         }
 
-                        for(ptrdiff_t j = S_rem.ptr[i], e = S_rem.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = S_rem.col[j];
+                        for(ptrdiff_t j = S2_rem.ptr[i], e = S2_rem.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = S2_rem.col[j];
                             int d,k;
                             boost::tie(d,k) = Sp.remote_info(c);
 
@@ -365,8 +341,8 @@ struct smoothed_pmis {
 
                         nbr.clear();
 
-                        for(ptrdiff_t j = Af_loc.ptr[i], e = Af_loc.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_loc.col[j];
+                        for(ptrdiff_t j = S_loc.ptr[i], e = S_loc.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = S_loc.col[j];
                             nbr.push_back(c);
 
                             if (c != i) {
@@ -377,8 +353,8 @@ struct smoothed_pmis {
                         }
 
                         BOOST_FOREACH(ptrdiff_t k, nbr) {
-                            for(ptrdiff_t j = Af_loc.ptr[k], e = Af_loc.ptr[k+1]; j < e; ++j) {
-                                ptrdiff_t c = Af_loc.col[j];
+                            for(ptrdiff_t j = S_loc.ptr[k], e = S_loc.ptr[k+1]; j < e; ++j) {
+                                ptrdiff_t c = S_loc.col[j];
                                 if (c != k && loc_state[c] == undone) {
                                     loc_owner[c] = comm.rank;
                                     loc_state[c] = id;
@@ -420,8 +396,11 @@ struct smoothed_pmis {
             for(size_t i = 0; i < Sp.recv.nbr.size(); ++i) {
                 int npts = send_pts[i].size();
                 MPI_Wait(&send_cnt_req[i], MPI_STATUS_IGNORE);
+
                 if (!npts) continue;
                 MPI_Wait(&send_pts_req[i], MPI_STATUS_IGNORE);
+
+                send_pts[i].clear();
             }
 
 
@@ -477,8 +456,9 @@ struct smoothed_pmis {
                 P_rem.val[P_rem.ptr[i]] = math::identity<value_type>();
             }
         }
+        AMGCL_TOC("tentative prolongation");
 
-        return boost::make_shared<DM>(comm, p_loc, p_rem, Af.backend_prm());
+        return boost::make_shared<DM>(comm, p_loc, p_rem, bprm);
     }
 
     boost::shared_ptr< distributed_matrix<Backend> >
