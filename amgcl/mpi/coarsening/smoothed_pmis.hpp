@@ -59,6 +59,8 @@ struct smoothed_pmis {
         /// Relaxation factor.
         scalar_type relax;
 
+        unsigned block_size;
+
         // Use power iterations to estimate the matrix spectral radius.
         // This usually improves convergence rate and results in faster solves,
         // but costs some time during setup.
@@ -69,22 +71,24 @@ struct smoothed_pmis {
         int power_iters;
 
         params()
-            : eps_strong(0.08), relax(1.0f),
+            : eps_strong(0.08), relax(1.0f), block_size(1),
               estimate_spectral_radius(false), power_iters(5)
         { }
 
         params(const boost::property_tree::ptree &p)
             : AMGCL_PARAMS_IMPORT_VALUE(p, eps_strong),
               AMGCL_PARAMS_IMPORT_VALUE(p, relax),
+              AMGCL_PARAMS_IMPORT_VALUE(p, block_size),
               AMGCL_PARAMS_IMPORT_VALUE(p, estimate_spectral_radius),
               AMGCL_PARAMS_IMPORT_VALUE(p, power_iters)
         {
-            AMGCL_PARAMS_CHECK(p, (eps_strong)(relax)(estimate_spectral_radius)(power_iters));
+            AMGCL_PARAMS_CHECK(p, (eps_strong)(relax)(block_size)(estimate_spectral_radius)(power_iters));
         }
 
         void get(boost::property_tree::ptree &p, const std::string &path) const {
             AMGCL_PARAMS_EXPORT_VALUE(p, path, eps_strong);
             AMGCL_PARAMS_EXPORT_VALUE(p, path, relax);
+            AMGCL_PARAMS_EXPORT_VALUE(p, path, block_size);
             AMGCL_PARAMS_EXPORT_VALUE(p, path, estimate_spectral_radius);
             AMGCL_PARAMS_EXPORT_VALUE(p, path, power_iters);
         }
@@ -226,7 +230,18 @@ struct smoothed_pmis {
 
     template <class LM, class RM>
     boost::shared_ptr< distributed_matrix<Backend, LM, RM> >
-    tentative_prolongation(const distributed_matrix<Backend, LM, RM> &Af) {
+    coarse_operator(
+            const distributed_matrix<Backend, LM, RM> &A,
+            const distributed_matrix<Backend, LM, RM> &P,
+            const distributed_matrix<Backend, LM, RM> &R
+            ) const
+    {
+        return amgcl::coarsening::detail::galerkin(A, P, R);
+    }
+
+    template <class LM, class RM>
+    boost::shared_ptr< distributed_matrix<Backend, LM, RM> >
+    tentative_prolongation(const distributed_matrix<Backend, LM, RM> Af) const {
         typedef distributed_matrix<Backend, LM, RM> DM;
 
         static const int tag_exc_cnt = 4001;
@@ -234,14 +249,23 @@ struct smoothed_pmis {
 
         const build_matrix &Af_loc = *Af.local();
         const build_matrix &Af_rem = *Af.remote();
-
         ptrdiff_t n = Af_loc.nrows;
 
         communicator comm = Af.comm();
 
+        boost::shared_ptr<DM> Ap = boost::make_shared<DM>(comm,
+                pointwise_matrix(Af_loc, prm.block_size),
+                pointwise_matrix(Af_rem, prm.block_size),
+                Af.backend_prm());
+
+
+        const build_matrix &Ap_loc = *Ap->local();
+        const build_matrix &Ap_rem = *Ap->remote();
+        ptrdiff_t np = Ap_loc.nrows;
+
         // 1. Get symbolic square of the filtered matrix.
         AMGCL_TIC("symbolic square");
-        boost::shared_ptr<DM> S = symb_product(Af, Af);
+        boost::shared_ptr<DM> S = symb_product(*Ap, *Ap);
         const build_matrix &S_loc = *S->local();
         const build_matrix &S_rem = *S->remote();
         const comm_pattern<Backend> &Sp = S->cpat();
@@ -253,15 +277,15 @@ struct smoothed_pmis {
         const ptrdiff_t deleted  = -1;
 
         ptrdiff_t n_undone = 0;
-        std::vector<int>       loc_owner(n, -1);
-        std::vector<ptrdiff_t> loc_state(n, undone);
+        std::vector<int>       loc_owner(np, -1);
+        std::vector<ptrdiff_t> loc_state(np, undone);
         std::vector<ptrdiff_t> rem_state(Sp.recv.count(), undone);
         std::vector<ptrdiff_t> send_state(Sp.send.count());
 
         // Remove lonely nodes.
 #pragma omp parallel for reduction(+:n_undone)
-        for(ptrdiff_t i = 0; i < n; ++i) {
-            ptrdiff_t wl = Af_loc.ptr[i+1] - Af_loc.ptr[i];
+        for(ptrdiff_t i = 0; i < np; ++i) {
+            ptrdiff_t wl = Ap_loc.ptr[i+1] - Ap_loc.ptr[i];
             ptrdiff_t wr = S_rem.ptr[i+1] - S_rem.ptr[i];
 
             if (wl + wr == 1) {
@@ -272,7 +296,7 @@ struct smoothed_pmis {
             }
         }
 
-        n_undone = n - n_undone;
+        n_undone = np - n_undone;
 
         // Exchange state
         for(ptrdiff_t i = 0, m = Sp.send.count(); i < m; ++i)
@@ -294,7 +318,7 @@ struct smoothed_pmis {
                 send_pts[i].clear();
 
             if (n_undone) {
-                for(ptrdiff_t i = 0; i < n; ++i) {
+                for(ptrdiff_t i = 0; i < np; ++i) {
                     if (loc_state[i] != undone) continue;
 
                     if (S_rem.ptr[i+1] > S_rem.ptr[i]) {
@@ -318,8 +342,8 @@ struct smoothed_pmis {
                         --n_undone;
 
                         // Af gives immediate neighbors
-                        for(ptrdiff_t j = Af_loc.ptr[i], e = Af_loc.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_loc.col[j];
+                        for(ptrdiff_t j = Ap_loc.ptr[i], e = Ap_loc.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = Ap_loc.col[j];
                             if (c != i) {
                                 if (loc_state[c] == undone) --n_undone;
                                 loc_owner[c] = comm.rank;
@@ -327,8 +351,8 @@ struct smoothed_pmis {
                             }
                         }
 
-                        for(ptrdiff_t j = Af_rem.ptr[i], e = Af_rem.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_rem.col[j];
+                        for(ptrdiff_t j = Ap_rem.ptr[i], e = Ap_rem.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = Ap_rem.col[j];
                             int d,k;
                             boost::tie(d,k) = Sp.remote_info(c);
 
@@ -367,8 +391,8 @@ struct smoothed_pmis {
 
                         nbr.clear();
 
-                        for(ptrdiff_t j = Af_loc.ptr[i], e = Af_loc.ptr[i+1]; j < e; ++j) {
-                            ptrdiff_t c = Af_loc.col[j];
+                        for(ptrdiff_t j = Ap_loc.ptr[i], e = Ap_loc.ptr[i+1]; j < e; ++j) {
+                            ptrdiff_t c = Ap_loc.col[j];
                             nbr.push_back(c);
 
                             if (c != i) {
@@ -379,8 +403,8 @@ struct smoothed_pmis {
                         }
 
                         BOOST_FOREACH(ptrdiff_t k, nbr) {
-                            for(ptrdiff_t j = Af_loc.ptr[k], e = Af_loc.ptr[k+1]; j < e; ++j) {
-                                ptrdiff_t c = Af_loc.col[j];
+                            for(ptrdiff_t j = Ap_loc.ptr[k], e = Ap_loc.ptr[k+1]; j < e; ++j) {
+                                ptrdiff_t c = Ap_loc.col[j];
                                 if (c != k && loc_state[c] == undone) {
                                     loc_owner[c] = comm.rank;
                                     loc_state[c] = id;
@@ -447,6 +471,55 @@ struct smoothed_pmis {
         build_matrix &P_loc = *p_loc;
         build_matrix &P_rem = *p_rem;
 
+#if 1
+        naggr *= prm.block_size;
+
+        std::vector<ptrdiff_t> aggr_dom = exclusive_sum(comm, naggr);
+        P_loc.set_size(n, naggr, true);
+        P_rem.set_size(n, 0, true);
+
+#pragma omp parallel for
+        for(ptrdiff_t p = 0; p < np; ++p) {
+            if (loc_state[p] == deleted) continue;
+
+            ptrdiff_t i = p * prm.block_size;
+
+            if (loc_owner[p] == comm.rank) {
+                for(unsigned k = 0; k < prm.block_size; ++k)
+                    ++P_loc.ptr[i + k + 1];
+            } else {
+                for(unsigned k = 0; k < prm.block_size; ++k)
+                    ++P_rem.ptr[i + k + 1];
+            }
+        }
+
+        P_loc.set_nonzeros(P_loc.scan_row_sizes());
+        P_rem.set_nonzeros(P_rem.scan_row_sizes());
+
+#pragma omp parallel for
+        for(ptrdiff_t p = 0; p < np; ++p) {
+            ptrdiff_t s = loc_state[p];
+            if (s == deleted) continue;
+
+            ptrdiff_t i = p * prm.block_size;
+            s *= prm.block_size;
+
+            int d = loc_owner[p];
+            if (d == comm.rank) {
+                for(unsigned k = 0; k < prm.block_size; ++k) {
+                    ptrdiff_t head = P_loc.ptr[i + k];
+                    P_loc.col[head] = s + k;
+                    P_loc.val[head] = math::identity<value_type>();
+                }
+            } else {
+                for(unsigned k = 0; k < prm.block_size; ++k) {
+                    ptrdiff_t head = P_rem.ptr[i + k];
+                    P_rem.col[head] = s + k + aggr_dom[d];
+                    P_rem.val[head] = math::identity<value_type>();
+                }
+            }
+        }
+#else
         std::vector<ptrdiff_t> aggr_dom = exclusive_sum(comm, naggr);
         P_loc.set_size(n, naggr, true);
         P_rem.set_size(n, 0, true);
@@ -479,19 +552,152 @@ struct smoothed_pmis {
                 P_rem.val[P_rem.ptr[i]] = math::identity<value_type>();
             }
         }
+#endif
 
         return boost::make_shared<DM>(comm, p_loc, p_rem, Af.backend_prm());
     }
 
-    template <class LM, class RM>
-    boost::shared_ptr< distributed_matrix<Backend, LM, RM> >
-    coarse_operator(
-            const distributed_matrix<Backend, LM, RM> &A,
-            const distributed_matrix<Backend, LM, RM> &P,
-            const distributed_matrix<Backend, LM, RM> &R
-            ) const
+    boost::shared_ptr<build_matrix>
+    pointwise_matrix(const build_matrix &A, size_t block_size) const
     {
-        return amgcl::coarsening::detail::galerkin(A, P, R);
+        const ptrdiff_t n  = A.nrows;
+        const ptrdiff_t m  = A.ncols;
+        const ptrdiff_t np = n / block_size;
+        const ptrdiff_t mp = m / block_size;
+
+        amgcl::precondition(n % block_size == 0,
+                "Matrix size should be divisible by block_size");
+
+        boost::shared_ptr<build_matrix> ap = boost::make_shared<build_matrix>();
+        build_matrix &Ap = *ap;
+
+        Ap.set_size(np, mp, true);
+
+#pragma omp parallel
+        {
+            std::vector<ptrdiff_t> j(block_size);
+            std::vector<ptrdiff_t> e(block_size);
+
+#pragma omp for
+            for(ptrdiff_t ip = 0; ip < np; ++ip) {
+                ptrdiff_t ia = ip * block_size;
+                ptrdiff_t cur_col = 0;
+                bool done = true;
+
+                for(unsigned k = 0; k < block_size; ++k) {
+                    ptrdiff_t beg = j[k] = A.ptr[ia + k];
+                    ptrdiff_t end = e[k] = A.ptr[ia + k + 1];
+
+                    if (beg == end) continue;
+
+                    ptrdiff_t c = A.col[beg];
+
+                    if (done) {
+                        done = false;
+                        cur_col = c;
+                    } else {
+                        cur_col = std::min(cur_col, c);
+                    }
+                }
+
+                while(!done) {
+                    cur_col /= block_size;
+                    ++Ap.ptr[ip + 1];
+
+                    done = true;
+                    ptrdiff_t col_end = (cur_col + 1) * block_size;
+                    for(unsigned k = 0; k < block_size; ++k) {
+                        ptrdiff_t beg = j[k];
+                        ptrdiff_t end = e[k];
+
+                        while(beg < end) {
+                            ptrdiff_t c = A.col[beg++];
+
+                            if (c >= col_end) {
+                                c /= block_size;
+
+                                if (done) {
+                                    done = false;
+                                    cur_col = c;
+                                } else {
+                                    cur_col = std::min(cur_col, c);
+                                }
+
+                                break;
+                            }
+                        }
+
+                        j[k] = beg;
+                    }
+                }
+            }
+        }
+
+        Ap.set_nonzeros(Ap.scan_row_sizes(), false);
+
+#pragma omp parallel
+        {
+            std::vector<ptrdiff_t> j(block_size);
+            std::vector<ptrdiff_t> e(block_size);
+
+#pragma omp for
+            for(ptrdiff_t ip = 0; ip < np; ++ip) {
+                ptrdiff_t ia = ip * block_size;
+                ptrdiff_t cur_col = 0;
+                ptrdiff_t head = Ap.ptr[ip];
+                bool done = true;
+
+                for(unsigned k = 0; k < block_size; ++k) {
+                    ptrdiff_t beg = j[k] = A.ptr[ia + k];
+                    ptrdiff_t end = e[k] = A.ptr[ia + k + 1];
+
+                    if (beg == end) continue;
+
+                    ptrdiff_t c = A.col[beg];
+
+                    if (done) {
+                        done = false;
+                        cur_col = c;
+                    } else {
+                        cur_col = std::min(cur_col, c);
+                    }
+                }
+
+                while(!done) {
+                    cur_col /= block_size;
+
+                    Ap.col[head++] = cur_col;
+
+                    done = true;
+                    ptrdiff_t col_end = (cur_col + 1) * block_size;
+                    for(unsigned k = 0; k < block_size; ++k) {
+                        ptrdiff_t beg = j[k];
+                        ptrdiff_t end = e[k];
+
+                        while(beg < end) {
+                            ptrdiff_t c = A.col[beg];
+
+                            if (c >= col_end) {
+                                if (done) {
+                                    done = false;
+                                    cur_col = c;
+                                } else {
+                                    cur_col = std::min(cur_col, c);
+                                }
+
+                                break;
+                            }
+
+                            ++beg;
+                        }
+
+                        j[k] = beg;
+                    }
+                }
+            }
+        }
+
+        return ap;
     }
 };
 
