@@ -305,7 +305,16 @@ class amg {
         const matrix& system_matrix() const {
             return *levels.front().A;
         }
-
+  void updateMatrix(boost::shared_ptr<build_matrix> A,
+                    params &prm, const backend_params &bprm)
+  {
+    for(auto& level :levels){
+       level->A = Backend::copy_matrix(A, bprm);
+       level.relax = boost::make_shared<relax_type>(*A, prm.relax, bprm);
+       A = Coarsening::coarse_operator(*A, level.P, level.R, prm.coarsening);
+       sort_rows(*A);
+    }
+  }
     private:
         struct level {
             size_t m_rows, m_nonzeros;

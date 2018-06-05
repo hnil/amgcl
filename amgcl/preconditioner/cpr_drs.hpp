@@ -160,6 +160,14 @@ class cpr_drs {
             return S->system_matrix();
         }
 
+  void updateSmoother(boost::shared_ptr<build_matrix> K, const backend_params bprm){
+           S = boost::make_shared<SPrecond>(K,   prm.sprecond, bprm);
+	   //Fpp     = backend_type::copy_matrix(fpp, bprm);
+           // Scatter = backend_type::copy_matrix(scatter, bprm);
+           //rp = backend_type::create_vector(np, bprm);
+           //xp = backend_type::create_vector(np, bprm);
+           //rs = backend_type::create_vector(n, bprm);
+  }
     private:
         size_t n, np;
 
