@@ -196,7 +196,7 @@ class make_solver {
         }
 
         /// Returns reference to the constructed preconditioner.
-        const Precond& precond() const {
+        Precond& precond(){
             return P;
         }
 

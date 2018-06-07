@@ -159,15 +159,221 @@ class cpr_drs {
         const matrix& system_matrix() const {
             return S->system_matrix();
         }
+        template<class Matrix>
+        void updateSmoother(const Matrix& K, const backend_params bprm = backend_params()){
+             S = boost::make_shared<SPrecond>(boost::make_shared<build_matrix>(K) ,   prm.sprecond, bprm);
+             //Fpp     = backend_type::copy_matrix(fpp, bprm);
+                 // Scatter = backend_type::copy_matrix(scatter, bprm);
+                 rp = backend_type::create_vector(np, bprm);
+                 xp = backend_type::create_vector(np, bprm);
+                 rs = backend_type::create_vector(n, bprm);
+        }
+     template <class Matrix>
+     void initUpdate(const Matrix& KK, const backend_params bprm = backend_params()){
+         boost::shared_ptr<build_matrix> K = boost::make_shared<build_matrix>(KK);
+         typedef typename backend::row_iterator<build_matrix>::type row_iterator;
+         const int       B = prm.block_size;
+         const ptrdiff_t N = (prm.active_rows ? prm.active_rows : n);
 
-  void updateSmoother(boost::shared_ptr<build_matrix> K, const backend_params bprm){
-           S = boost::make_shared<SPrecond>(K,   prm.sprecond, bprm);
-	   //Fpp     = backend_type::copy_matrix(fpp, bprm);
-           // Scatter = backend_type::copy_matrix(scatter, bprm);
-           //rp = backend_type::create_vector(np, bprm);
-           //xp = backend_type::create_vector(np, bprm);
-           //rs = backend_type::create_vector(n, bprm);
-  }
+         precondition(
+                 prm.weights.empty() || prm.weights.size() == static_cast<size_t>(N),
+                 "CPR: weights size is not equal to number of active rows.");
+
+         np = N / B;
+
+         boost::shared_ptr<build_matrix> fpp = boost::make_shared<build_matrix>();
+         fpp->set_size(np, n);
+         fpp->set_nonzeros(n);
+         fpp->ptr[0] = 0;
+
+         boost::shared_ptr<build_matrix> App = boost::make_shared<build_matrix>();
+         App->set_size(np, np, true);
+
+#pragma omp parallel
+         {
+             std::vector<value_type> a_dia(B), a_off(B), a_top(B);
+             std::vector<row_iterator> k; k.reserve(B);
+
+#pragma omp for
+             for(ptrdiff_t ip = 0; ip < static_cast<ptrdiff_t>(np); ++ip) {
+                 ptrdiff_t ik = ip * B;
+                 bool      done = true;
+                 ptrdiff_t cur_col = 0;
+
+                 std::fill(a_dia.begin(), a_dia.end(), 0);
+                 std::fill(a_off.begin(), a_off.end(), 0);
+                 std::fill(a_top.begin(), a_top.end(), 0);
+
+                 k.clear();
+                 for(int i = 0; i < B; ++i) {
+                     k.push_back(backend::row_begin(*K, ik + i));
+
+                     if (k.back() && k.back().col() < N) {
+                         ptrdiff_t col = k.back().col() / B;
+                         if (done) {
+                             cur_col = col;
+                             done = false;
+                         } else {
+                             cur_col = std::min(cur_col, col);
+                         }
+                     }
+                 }
+
+                 while (!done) {
+                     ++App->ptr[ip+1];
+
+                     ptrdiff_t end = (cur_col + 1) * B;
+
+                     for(int i = 0; i < B; ++i) {
+                         for(; k[i] && k[i].col() < end; ++k[i]) {
+                             ptrdiff_t  c = k[i].col() % B;
+                             value_type v = k[i].value();
+
+                             if (i == 0) {
+                                 a_top[c] += std::abs(v);
+                             }
+
+                             if (c == 0) {
+                                 if (cur_col == ip) {
+                                     a_dia[i] = v;
+                                 } else {
+                                     a_off[i] += std::abs(v);
+                                 }
+                             }
+                         }
+                     }
+
+                     // Get next column number.
+                     done = true;
+                     for(int i = 0; i < B; ++i) {
+                         if (k[i] && k[i].col() < N) {
+                             ptrdiff_t col = k[i].col() / B;
+                             if (done) {
+                                 cur_col = col;
+                                 done = false;
+                             } else {
+                                 cur_col = std::min(cur_col, col);
+                             }
+                         }
+                     }
+                 }
+
+                 for(int i = 0; i < B; ++i) {
+                     fpp->col[ik+i] = ik+i;
+                     double delta = 1;
+
+                     if (!prm.weights.empty())
+                         delta *= prm.weights[ik+i];
+
+                     if (i > 0) {
+                         if (a_dia[i] < prm.eps_dd * a_off[i])
+                             delta = 0;
+
+                         if (a_top[i] < prm.eps_ps * std::abs(a_dia[0]))
+                             delta = 0;
+                     }
+
+                     fpp->val[ik+i] = delta;
+                 }
+
+                 fpp->ptr[ip+1] = ik + B;
+             }
+         }
+
+         std::partial_sum(App->ptr, App->ptr + np + 1, App->ptr);
+         App->set_nonzeros(App->ptr[np]);
+
+         boost::shared_ptr<build_matrix> scatter = boost::make_shared<build_matrix>();
+         scatter->set_size(n, np);
+         scatter->set_nonzeros(np);
+         scatter->ptr[0] = 0;
+
+#pragma omp parallel
+         {
+             std::vector<row_iterator> k; k.reserve(B);
+
+#pragma omp for
+             for(ptrdiff_t ip = 0; ip < static_cast<ptrdiff_t>(np); ++ip) {
+                 ptrdiff_t ik = ip * B;
+                 ptrdiff_t head = App->ptr[ip];
+                 bool      done = true;
+                 ptrdiff_t cur_col = 0;
+
+                 value_type *d = &fpp->val[ik];
+
+                 k.clear();
+                 for(int i = 0; i < B; ++i) {
+                     k.push_back(backend::row_begin(*K, ik + i));
+
+                     if (k.back() && k.back().col() < N) {
+                         ptrdiff_t col = k.back().col() / B;
+                         if (done) {
+                             cur_col = col;
+                             done = false;
+                         } else {
+                             cur_col = std::min(cur_col, col);
+                         }
+                     }
+                 }
+
+                 while (!done) {
+                     ptrdiff_t  end = (cur_col + 1) * B;
+                     value_type app = 0;
+
+                     for(int i = 0; i < B; ++i) {
+                         for(; k[i] && k[i].col() < end; ++k[i]) {
+                             if (k[i].col() % B == 0) {
+                                 app += d[i] * k[i].value();
+                             }
+                         }
+                     }
+
+                     App->col[head] = cur_col;
+                     App->val[head] = app;
+                     ++head;
+
+                     // Get next column number.
+                     done = true;
+                     for(int i = 0; i < B; ++i) {
+                         if (k[i] && k[i].col() < N) {
+                             ptrdiff_t col = k[i].col() / B;
+                             if (done) {
+                                 cur_col = col;
+                                 done = false;
+                             } else {
+                                 cur_col = std::min(cur_col, col);
+                             }
+                         }
+                     }
+                 }
+
+                 scatter->col[ip] = ip;
+                 scatter->val[ip] = math::identity<value_type>();
+
+                 ptrdiff_t nnz = ip;
+                 for(int i = 0; i < B; ++i) {
+                     if (i == 0) ++nnz;
+                     scatter->ptr[ik + i + 1] = nnz;
+                 }
+             }
+         }
+
+         for(size_t i = N; i < n; ++i)
+             scatter->ptr[i+1] = scatter->ptr[i];
+
+         //P = boost::make_shared<PPrecond>(App, prm.pprecond, bprm);
+         //P->updateMatrix(App,prm.pprecond, bprm);
+         S = boost::make_shared<SPrecond>(K,   prm.sprecond, bprm);
+
+         Fpp     = backend_type::copy_matrix(fpp, bprm);
+         Scatter = backend_type::copy_matrix(scatter, bprm);
+
+         rp = backend_type::create_vector(np, bprm);
+         xp = backend_type::create_vector(np, bprm);
+         rs = backend_type::create_vector(n, bprm);
+     }
+
+
     private:
         size_t n, np;
 
